@@ -5,61 +5,45 @@ require "file_utils"
 # =============================================================================
 # Netherite bot — single-file Rosegold port of netherite_mine.js + netherite_service.js
 #
-# Caveats vs the JS originals (Rosegold is headless, so some things change):
-#   * Sweep mining uses per-pitch-step `bot.dig` instead of "hold attack while
-#     panning the camera". Tune SWEEP_STEPS / SWEEP_DIG_TICKS.
-#   * No HUD / Draw3D. `!nt show` DMs you the coordinates of unmined debris.
-#   * No client command manager. Commands are `!nt stats / show / hide / reset / trim`
-#     sent in chat by MC_COMMANDER (env var) or by the bot itself.
-#   * No ItemPickup event. We poll `inventory.count("ancient_debris")` deltas.
-#   * Hover-text "Location: x y z" scrape is best-effort; falls back to bot's
-#     current block pos (same fallback the JS has for debris).
+# Writes finds to data/eu.mart3323.jsmacros/persistentVars/debrisFinds.json in
+# the same {pos:{x,y,z}, time, mined} shape Mart's JSMacros script uses, so you
+# can drop that file into your JSMacros profile and /nt show in-client will
+# highlight the debris blocks.
+#
+# Forward-movement strategy:
+#   1. Try move_to. Solid netherrack → done.
+#   2. MovementStuck? Mine straight ahead (sweep may have missed a block).
+#   3. Still stuck? Assume gap; brute-force place_block_against on candidate
+#      anchor blocks until one sticks.
+#   4. Try walking again. If still stuck, bail.
+#
+# Chat commands (gated by MC_COMMANDER env var):
+#   !nt stats | show | hide | reset | trim
 # =============================================================================
 
 # ---- Config -----------------------------------------------------------------
-SERVER          = ENV["MC_SERVER"]?    || "play.civmc.net"
-COMMANDER       = ENV["MC_COMMANDER"]? # in-game name allowed to drive !nt commands; nil = self-only
-DATA_DIR        = "data/eu.mart3323.jsmacros/persistentVars"
+SERVER         = ENV["MC_SERVER"]?    || "play.civmc.net"
+COMMANDER_NAME = ENV["MC_COMMANDER"]?
+DATA_DIR       = "data/eu.mart3323.jsmacros/persistentVars"
 
-MINING_HEIGHT        = 120.0
-LOW_ANGLE            =  66.5_f32
-HIGH_ANGLE           = -85.0_f32
-SWEEP_STEPS          = 24            # pitch steps per side
-SWEEP_DIG_TICKS      = 6             # ticks of dig per pitched step
-SKIPS                = [] of Tuple(Float64, Float64)
-END_Z                = 9000
-EAT_THRESHOLD        = 15
-
-WALK_DIR  = Rosegold::Vec3d.new(0.0, 0.0, 1.0)
-CROSS_DIR = Rosegold::Vec3d.new(WALK_DIR.z, 0.0, -WALK_DIR.x)
+MINING_HEIGHT   = 120.0
+LOW_ANGLE       =  66.5
+HIGH_ANGLE      = -85.0
+SWEEP_STEPS     = 24
+SWEEP_DIG_TICKS = 6
+END_Z           = 9000
+EAT_THRESHOLD   = 15
+SKIPS           = [] of Tuple(Float64, Float64)
 
 DEBRIS_KEY   = "debrisFinds"
 DIAMONDS_KEY = "diamonds"
 
-# ---- Persistent store (one JSON file per key, mirrors Mart's Proxy) ---------
-FileUtils.mkdir_p(DATA_DIR)
-
-def store_path(name : String) : String
-  File.join(DATA_DIR, "#{name}.json")
-end
-
-def store_get_array(name : String) : Array(JSON::Any)
-  path = store_path(name)
-  return [] of JSON::Any unless File.exists?(path)
-  (JSON.parse(File.read(path)).as_a? || [] of JSON::Any)
-rescue JSON::ParseException
-  [] of JSON::Any
-end
-
-def store_set(name : String, value)
-  File.write(store_path(name), value.to_json)
-rescue ex
-  STDERR.puts "[store] write #{name} failed: #{ex.message}"
-end
-
+# ---- JSON shapes (matches netherite_service.js exactly) ---------------------
 struct Pos
   include JSON::Serializable
-  property x : Int32, y : Int32, z : Int32
+  property x : Int32
+  property y : Int32
+  property z : Int32
 
   def initialize(@x, @y, @z); end
 end
@@ -72,67 +56,84 @@ struct Find
 
   def initialize(@pos, @time, @mined); end
 
-  # Convenience for the old `Find.new(x, y, z, time, mined)` callsites.
-  def self.new(x : Int32, y : Int32, z : Int32, time : Int64, mined : Bool) : self
-    new(Pos.new(x, y, z), time, mined)
+  def initialize(x : Int32, y : Int32, z : Int32, time : Int64, mined : Bool)
+    @pos   = Pos.new(x, y, z)
+    @time  = time
+    @mined = mined
   end
 
-  # And convenience accessors so existing code reading f.x still works.
   def x; pos.x; end
   def y; pos.y; end
   def z; pos.z; end
 end
 
+# ---- File-backed store ------------------------------------------------------
+FileUtils.mkdir_p(DATA_DIR)
+
+def store_path(name : String) : String
+  File.join(DATA_DIR, "#{name}.json")
+end
+
 def load_finds(key : String) : Array(Find)
-  store_get_array(key).map { |any| Find.from_json(any.to_json) }
+  path = store_path(key)
+  return [] of Find unless File.exists?(path)
+  Array(Find).from_json(File.read(path))
+rescue
+  [] of Find
 end
 
 def save_finds(key : String, finds : Array(Find))
-  store_set(key, finds)
+  File.write(store_path(key), finds.to_json)
+rescue ex
+  STDERR.puts "[store] write #{key} failed: #{ex.message}"
 end
 
-# Seed empty arrays on first run.
-store_set(DEBRIS_KEY,   [] of Find) unless File.exists?(store_path(DEBRIS_KEY))
-store_set(DIAMONDS_KEY, [] of Find) unless File.exists?(store_path(DIAMONDS_KEY))
+save_finds(DEBRIS_KEY,   [] of Find) unless File.exists?(store_path(DEBRIS_KEY))
+save_finds(DIAMONDS_KEY, [] of Find) unless File.exists?(store_path(DIAMONDS_KEY))
 
 # ---- Connect ----------------------------------------------------------------
-bot = Rosegold::Bot.join_game(SERVER)
+BOT = Rosegold::Bot.join_game(SERVER)
 sleep 3.seconds
-puts "[netherite] connected as #{bot.username} at #{bot.feet}"
+puts "[netherite] connected as #{BOT.username} at #{BOT.location}"
 
-# ---- Service: chat-driven find tracking + !nt commands ----------------------
-show_hud = false
-last_debris_count = 0
+module State
+  class_property show_hud = false
+  class_property last_debris_count = 0
+end
 
-report = ->(msg : String) do
+# ---- Service: !nt commands + chat-driven find tracking ----------------------
+def report(msg : String)
   puts "[nt] #{msg}"
-  if cmd = COMMANDER
-    bot.chat "/msg #{cmd} [nt] #{msg}" rescue nil
+  if cmd = COMMANDER_NAME
+    BOT.chat("/msg #{cmd} [nt] #{msg}") rescue nil
   end
 end
 
-bot_block_pos = -> do
-  pos = bot.feet
-  {pos.x.floor.to_i, pos.y.floor.to_i, pos.z.floor.to_i}
+def bot_block_pos : Tuple(Int32, Int32, Int32)
+  b = BOT.location.block # Vec3i, floored
+  {b.x, b.y, b.z}
 end
 
-record_find = ->(key : String, xyz : Tuple(Int32, Int32, Int32)) do
+def record_find(key : String, xyz : Tuple(Int32, Int32, Int32))
   finds = load_finds(key)
   finds << Find.new(xyz[0], xyz[1], xyz[2], Time.utc.to_unix_ms, false)
   save_finds(key, finds)
   label = key == DEBRIS_KEY ? "debris" : "diamond"
-  report.call("#{label} @ #{xyz[0]} #{xyz[1]} #{xyz[2]}")
+  report("#{label} @ #{xyz[0]} #{xyz[1]} #{xyz[2]}")
 end
 
-collect_debris = ->(pos : Rosegold::Vec3d) do
+def collect_debris(loc)
   finds = load_finds(DEBRIS_KEY)
-  candidate = finds.select { |f| !f.mined }.min_by? do |f|
-    dx = f.x - pos.x; dy = f.y - pos.y; dz = f.z - pos.z
-    dx*dx + dy*dy + dz*dz
+  unmined = finds.select { |f| !f.mined }
+  return if unmined.empty?
+
+  loc_v = Rosegold::Vec3d.new(loc.x.to_f64, loc.y.to_f64, loc.z.to_f64)
+  candidate = unmined.min_by do |f|
+    fv = Rosegold::Vec3d.new(f.x.to_f64, f.y.to_f64, f.z.to_f64)
+    fv.dist_sq(loc_v)
   end
-  next unless candidate
-  dx = candidate.x - pos.x; dy = candidate.y - pos.y; dz = candidate.z - pos.z
-  next if dx*dx + dy*dy + dz*dz > 100.0 # 10 blocks
+  cv = Rosegold::Vec3d.new(candidate.x.to_f64, candidate.y.to_f64, candidate.z.to_f64)
+  return if cv.dist_sq(loc_v) > 100.0 # 10 blocks
 
   updated = finds.map do |f|
     if !f.mined && f.x == candidate.x && f.y == candidate.y && f.z == candidate.z
@@ -144,232 +145,289 @@ collect_debris = ->(pos : Rosegold::Vec3d) do
   save_finds(DEBRIS_KEY, updated)
 end
 
-dispatch = ->(verb : String?) do
+def dispatch_command(verb)
   case verb
   when "show"
-    show_hud = true
+    State.show_hud = true
     finds = load_finds(DEBRIS_KEY).reject(&.mined)
-    report.call("showing #{finds.size} unmined debris find(s):")
-    finds.each { |f| report.call("  #{f.x} #{f.y} #{f.z}") }
+    report("showing #{finds.size} unmined debris find(s):")
+    finds.each { |f| report("  #{f.x} #{f.y} #{f.z}") }
   when "hide", "clearhud"
-    show_hud = false
-    report.call("hud-equivalent hidden")
+    State.show_hud = false
+    report("show-mode off")
   when "stats"
     finds = load_finds(DEBRIS_KEY)
     if finds.empty?
-      report.call("no debris finds recorded yet")
+      report("no debris finds recorded yet")
     else
-      oldest = finds.min_by(&.time)
+      oldest        = finds.min_by(&.time)
       mined_count   = finds.count(&.mined)
       unmined_count = finds.size - mined_count
       session_ms    = (Time.utc.to_unix_ms - oldest.time).to_f
       minutes       = session_ms / 60_000.0
       per_hour      = finds.size / (session_ms / 3_600_000.0)
-      report.call("session: #{"%.2f" % minutes} min")
-      report.call("debris found: #{finds.size} (#{unmined_count} not yet mined)")
-      report.call("debris/hour: #{"%.2f" % per_hour}")
+      report("session: #{"%.2f" % minutes} min")
+      report("debris found: #{finds.size} (#{unmined_count} not yet mined)")
+      report("debris/hour: #{"%.2f" % per_hour}")
     end
   when "reset"
     save_finds(DEBRIS_KEY, [] of Find)
-    report.call("debris finds reset")
+    report("debris finds reset")
   when "trim"
     finds = load_finds(DEBRIS_KEY).reject(&.mined)
     save_finds(DEBRIS_KEY, finds)
-    report.call("trimmed; #{finds.size} unmined finds remain")
+    report("trimmed; #{finds.size} unmined finds remain")
   end
 end
 
-# System chat: server messages ("You sense debris/diamond") + self-driven commands.
-bot.on(Rosegold::Clientbound::SystemChatMessage) do |event|
-  msg = event.message.to_s.strip
+# ---- TextComponent → plain string (recursive, strips color codes) -----------
+# SystemChatMessage#message is a TextComponent; its #to_s returns the object
+# address, not the text. We have to walk text + extra (child components) ourselves.
+def flatten_text(comp) : String
+  return "" unless comp
+  String.build do |io|
+    io << comp.text if comp.text
+    comp.extra.try &.each { |child| io << flatten_text(child) }
+  end
+end
+
+
+BOT.on(Rosegold::Clientbound::SystemChatMessage) do |event|
+  msg = flatten_text(event.message).strip
+
   if msg.starts_with?("You sense a diamond")
-    record_find.call(DIAMONDS_KEY, bot_block_pos.call)
+    record_find(DIAMONDS_KEY, bot_block_pos)
   elsif msg.starts_with?("You sense debris")
-    record_find.call(DEBRIS_KEY, bot_block_pos.call)
+    record_find(DEBRIS_KEY, bot_block_pos)
   end
+
   if m = msg.match(/!nt\s+(\w+)/)
-    dispatch.call(m[1])
+    dispatch_command(m[1])
   end
 end
 
-# Player chat: commands from MC_COMMANDER (or bot itself).
-bot.on(Rosegold::Clientbound::PlayerChatMessage) do |event|
-  sender = event.network_name.to_s
-  msg    = event.message.to_s
-  allowed = COMMANDER.nil? || sender == COMMANDER || sender == bot.username
+BOT.on(Rosegold::Clientbound::PlayerChatMessage) do |event|
+  sender = flatten_text(event.network_name)
+  msg    = event.message # already a String on PlayerChatMessage
+  allowed = COMMANDER_NAME.nil? || sender == COMMANDER_NAME || sender == BOT.username
   next unless allowed
   next unless msg.starts_with?("!nt ")
   verb = msg[4..].strip.split(/\s+/).first?
-  dispatch.call(verb)
+  dispatch_command(verb) if verb
 end
 
-# ---- Miner helpers ----------------------------------------------------------
-lerp = ->(a : Float32, b : Float32, t : Float32) { a + t * (b - a) }
-
-look_direction = ->(dir : Rosegold::Vec3d) do
-  eye    = bot.feet + Rosegold::Vec3d.new(0.0, bot.eye_height, 0.0)
-  target = eye + dir
-  bot.look_at(target)
+# ---- Inventory maintenance --------------------------------------------------
+def valid_pickaxe?(slot) : Bool
+  return false unless slot.name == "diamond_pickaxe"
+  return false unless slot.durability > 10
+  # JS condition: efficiency > 1 && efficiency < 4 (so Eff II or III).
+  eff = slot.efficiency rescue 0
+  eff > 1 && eff < 4
 end
 
-in_skip_zone? = -> do
-  z = bot.feet.z
-  SKIPS.any? { |(lo, hi)| z >= lo && z <= hi }
-end
-
-block_below_feet = -> do
-  f = bot.feet
-  Rosegold::Vec3i.new(f.x.floor.to_i, (f.y - 1).floor.to_i, f.z.floor.to_i)
-end
-
-# JS pickaxe condition: diamond, durability > 10, eff > 1 && eff < 4 (so II or III).
-valid_pickaxe? = ->(slot : Rosegold::Slot) do
-  next false unless slot.name == "diamond_pickaxe"
-  next false unless slot.durability > 10
-  enchants = slot.enchantments rescue nil
-  next false unless enchants
-  lvl = enchants["efficiency"]?
-  next false unless lvl
-  lvl > 1 && lvl < 4
-end
-
-maintain_pickaxe! = -> do
-  next if valid_pickaxe?.call(bot.main_hand)
-  begin
-    bot.inventory.pick! { |s| valid_pickaxe?.call(s) }
-  rescue Rosegold::Inventory::ItemNotFoundError
-    bot.chat "/g ! out of pickaxes, disconnecting"
-    bot.wait_ticks 5
+def maintain_pickaxe!
+  return if valid_pickaxe?(BOT.main_hand)
+  ok = BOT.inventory.pick { |s| valid_pickaxe?(s) }
+  unless ok
+    BOT.chat("/g ! out of pickaxes, disconnecting")
+    BOT.wait_ticks 5
     raise "out of pickaxes"
   end
 end
 
-ensure_netherrack! = -> do
-  next if bot.main_hand.name == "netherrack"
-  begin
-    bot.inventory.pick! "netherrack"
-  rescue Rosegold::Inventory::ItemNotFoundError
-    bot.chat "/g ! out of netherrack"
+def ensure_netherrack!
+  return if BOT.main_hand.name == "netherrack"
+  ok = BOT.inventory.pick("netherrack")
+  unless ok
+    BOT.chat("/g ! out of netherrack")
     raise "out of netherrack"
   end
 end
 
-maintain_hunger! = -> do
-  next if bot.food > EAT_THRESHOLD
-  bot.eat! rescue puts "[miner] eat! failed (out of food?)"
+def maintain_hunger!
+  return if BOT.food > EAT_THRESHOLD
+  BOT.eat! rescue puts "[miner] eat! failed (out of food?)"
 end
 
-check_debris_pickup = -> do
-  now = bot.inventory.count("ancient_debris")
-  if now > last_debris_count
-    collect_debris.call(bot.feet)
+# ---- Misc helpers -----------------------------------------------------------
+def lerp(a : Float64, b : Float64, t : Float64) : Float64
+  a + t * (b - a)
+end
+
+def in_skip_zone? : Bool
+  z = BOT.location.z
+  SKIPS.any? { |range| z >= range[0] && z <= range[1] }
+end
+
+def check_debris_pickup
+  now = BOT.inventory.count("ancient_debris")
+  if now > State.last_debris_count
+    collect_debris(BOT.location)
   end
-  last_debris_count = now
+  State.last_debris_count = now
 end
 
-# ---- Miner steps ------------------------------------------------------------
-center_on_block = -> do
-  feet = bot.feet
-  bx = feet.x.floor
-  bz = feet.z.floor
-  if (feet.x - (bx + 0.5)).abs > 0.1 || (feet.z - (bz + 0.5)).abs > 0.1
-    bot.move_to(bx + 0.5, feet.y, bz + 0.5)
-    bot.wait_ticks 4
-  end
+# ---- Mining steps -----------------------------------------------------------
+def center_on_block
+  loc = BOT.location
+  centered = loc.block.centered_3d.with_y(loc.y) # x+0.5, y, z+0.5
+  return if loc.almost_eq(centered, closer_than: 0.1)
+  BOT.move_to(centered) rescue nil
+  BOT.wait_ticks 4
 end
 
-pillar_up = -> do
-  while bot.feet.y < MINING_HEIGHT
-    ensure_netherrack!.call
-    bot.pitch = 90.0_f32
-    bot.wait_ticks 1
-    feet_block = block_below_feet.call
-    bot.start_jumping
-    bot.wait_ticks 2
+def pillar_up
+  while BOT.location.y < MINING_HEIGHT
+    ensure_netherrack!
+    BOT.pitch = 90.0
+    BOT.wait_ticks 1
+
+    feet_blk = BOT.location.block.down(1) # block directly under feet
     begin
-      bot.place_block_against(feet_block, :top)
+      BOT.start_jump
+      BOT.wait_ticks 2
+      BOT.place_block_against(feet_blk, :top)
     rescue ex
-      puts "[miner] pillar place failed (#{ex.message}); retrying"
+      puts "[miner] pillar place failed: #{ex.message}"
     end
-    bot.stop_jumping
-    bot.wait_ticks 2
-    break if bot.feet.y >= MINING_HEIGHT
+    BOT.land_on_ground(timeout_ticks: 20) rescue nil
+    break if BOT.location.y >= MINING_HEIGHT
   end
 end
 
-pitched_sweep = -> do
-  yaw = bot.yaw
+# Sweep one side of the ring by panning pitch low→high while attacking.
+def pitched_sweep(direction_face : Symbol)
+  yaw_at_start = BOT.yaw
   SWEEP_STEPS.times do |i|
-    alpha = i.to_f32 / SWEEP_STEPS
-    bot.yaw   = yaw
-    bot.pitch = lerp.call(LOW_ANGLE, HIGH_ANGLE, alpha)
-    bot.dig(SWEEP_DIG_TICKS)
+    alpha = i.to_f64 / SWEEP_STEPS
+    pitch = lerp(LOW_ANGLE, HIGH_ANGLE, alpha)
+
+    # Aim eyes in the given cardinal direction at the current pitch.
+    # Pick a Vec3d 5 blocks away in that direction.
+    eye = Rosegold::Vec3d.new(BOT.location.x, BOT.location.y + 1.62, BOT.location.z)
+    target = case direction_face
+             when :east  then eye.east(5)
+             when :west  then eye.west(5)
+             when :north then eye.north(5)
+             when :south then eye.south(5)
+             else             eye.east(5)
+             end
+    BOT.look_at(target)
+    BOT.yaw   = yaw_at_start
+    BOT.pitch = pitch
+    BOT.dig(SWEEP_DIG_TICKS)
   end
 end
 
-sweep_ring = -> do
-  maintain_pickaxe!.call
-  look_direction.call(CROSS_DIR)
-  pitched_sweep.call
-  maintain_pickaxe!.call
-  look_direction.call(CROSS_DIR.scale(-1.0))
-  pitched_sweep.call
+def sweep_ring
+  maintain_pickaxe!
+  pitched_sweep(:east)
+  maintain_pickaxe!
+  pitched_sweep(:west)
 end
 
-bridge_if_gap = ->(dest : Rosegold::Vec3d) do
-  below = Rosegold::Vec3i.new(dest.x.floor.to_i, (dest.y - 1).floor.to_i, dest.z.floor.to_i)
-  block = bot.dimension.block_at(below) rescue nil
-  next if block && block.name != "air" && block.name != "cave_air"
+def mine_ahead
+  maintain_pickaxe!
+  eye   = Rosegold::Vec3d.new(BOT.location.x, BOT.location.y + 1.62, BOT.location.z)
+  ahead = eye.south(5) # +Z = south in MC
+  BOT.look_at(ahead)
+  BOT.pitch = 0.0
+  BOT.dig(20)
+  BOT.pitch = 30.0
+  BOT.dig(20)
+end
 
-  ensure_netherrack!.call
-  bot.sneak
-  behind = Rosegold::Vec3i.new(bot.feet.x.floor.to_i, (bot.feet.y - 1).floor.to_i, bot.feet.z.floor.to_i)
-  begin
-    bot.place_block_against(behind, :north)
-  rescue ex
-    puts "[miner] bridge failed: #{ex.message}"
+def try_blind_bridge
+  ensure_netherrack!
+  BOT.sneak
+  BOT.wait_ticks 2
+
+  feet = BOT.location.block # Vec3i
+
+  # Candidate (anchor Vec3i, face) pairs. Try the most obvious ones first.
+  candidates = [
+    {feet.down(1),                :top},   # block directly beneath
+    {feet.down(1).north(1),       :top},   # block behind+down (we came from -Z)
+    {feet.down(1).north(1),       :south}, # south face of behind-down
+    {feet.down(1).east(1),        :west},  # west face of east-down
+    {feet.down(1).west(1),        :east},  # east face of west-down
+    {feet.north(1),               :south}, # block behind at foot level, south face
+  ]
+
+  placed = false
+  candidates.each do |(anchor, face)|
+    begin
+      BOT.place_block_against(anchor, face)
+      placed = true
+      BOT.wait_ticks 2
+      break
+    rescue
+      # try the next candidate
+    end
   end
-  bot.stop_sneaking
+  BOT.unsneak
+  placed
 end
 
-mine_ahead = -> do
-  bot.pitch = 12.5_f32
-  bot.dig(40)
-end
+def step_forward
+  start_z = BOT.location.z
+  target  = BOT.location.with_z(start_z + 1.0)
 
-tunnel_forward = -> do
-  start  = bot.feet
-  target = Rosegold::Vec3d.new(start.x, start.y, start.z + 1.0)
-  bridge_if_gap.call(target)
   begin
-    bot.move_to(target.x, target.z)
+    BOT.move_to(target)
+    return true
   rescue Rosegold::Physics::MovementStuck
-    mine_ahead.call
-    bot.move_to(target.x, target.z)
+    puts "[miner] stuck moving forward; trying mine_ahead"
+  end
+
+  mine_ahead
+  begin
+    BOT.move_to(target)
+    return true
+  rescue Rosegold::Physics::MovementStuck
+    puts "[miner] still stuck; trying blind bridge"
+  end
+
+  bridged = try_blind_bridge
+  unless bridged
+    puts "[miner] couldn't bridge — no candidate anchor worked"
+    return false
+  end
+
+  begin
+    BOT.move_to(target)
+    return true
+  rescue Rosegold::Physics::MovementStuck
+    puts "[miner] still stuck after bridging; giving up"
+    return false
   end
 end
 
 # ---- Main loop --------------------------------------------------------------
-puts "[netherite] starting miner loop; commander=#{COMMANDER || "(self)"}"
+puts "[netherite] starting miner loop; commander=#{COMMANDER_NAME || "(self)"}"
 
 begin
-  while bot.connected?
-    center_on_block.call
-    pillar_up.call
-    sweep_ring.call unless in_skip_zone?.call
-    tunnel_forward.call
-    maintain_pickaxe!.call
-    maintain_hunger!.call
-    check_debris_pickup.call
-    break if bot.feet.z >= END_Z
+  while BOT.connected?
+    center_on_block
+    pillar_up
+    sweep_ring unless in_skip_zone?
+
+    unless step_forward
+      report("stuck — disconnecting for manual intervention")
+      break
+    end
+
+    maintain_pickaxe!
+    maintain_hunger!
+    check_debris_pickup
+
+    break if BOT.location.z >= END_Z
   end
-rescue ex : Rosegold::Physics::MovementStuck
-  puts "[miner] movement stuck: #{ex.message}; bailing"
 rescue ex
   puts "[miner] stopped: #{ex.message}"
   ex.backtrace.try &.each { |line| puts "  #{line}" }
 ensure
-  bot.chat "[netherite] disconnecting" rescue nil
+  BOT.chat("[netherite] disconnecting") rescue nil
   sleep 1.second
-  bot.disconnect rescue nil
+  BOT.disconnect rescue nil
 end
