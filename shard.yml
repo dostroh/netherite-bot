@@ -7,7 +7,7 @@ authors:
 
 targets:
   netherite-bot:
-    main: src/netherite-bot.cr
+    main: src/netherite_bot.cr
 
 
 crystal: '>= 1.17.1'
