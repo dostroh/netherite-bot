@@ -1,0 +1,74 @@
+name: Build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Crystal
+      uses: crystal-lang/install-crystal@v1
+
+    - name: Setup Crystal env (for next steps)
+      run: crystal env | Select-String 'CRYSTAL_LIBRARY_PATH' >> $env:GITHUB_ENV
+
+    - name: Set up Visual Studio shell
+      uses: egor-tensin/vs-shell@v2
+      with:
+        arch: x64
+
+    - name: Install dependencies
+      run: shards install
+
+    - name: Run release build
+      run: shards build --release --debug
+
+    - name: Get version
+      id: version
+      run: |
+        $version = crystal eval "require `"./src/rosegold-example`"; puts RosegoldExample::VERSION"
+        echo "version=$version" >> $env:GITHUB_OUTPUT
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: rosegold-example-windows-${{ steps.version.outputs.version }}
+        path: |
+          bin
+          README.md
+          LICENSE
+
+  build-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Crystal
+      uses: crystal-lang/install-crystal@v1
+      with:
+        crystal: latest
+
+    - name: Install dependencies
+      run: shards install
+
+    - name: Run release build
+      run: shards build --release --debug
+
+    - name: Get version
+      id: version
+      run: |
+        version=$(crystal eval "require \"./src/rosegold-example\"; puts RosegoldExample::VERSION")
+        echo "version=$version" >> $GITHUB_OUTPUT
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: rosegold-example-linux-${{ steps.version.outputs.version }}
+        path: |
+          bin
+          README.md
+          LICENSE

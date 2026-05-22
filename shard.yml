@@ -1,0 +1,20 @@
+name: rosegold-example
+version: 0.3.0
+description: Template repository for creating Minecraft bots with Rosegold.cr
+
+authors:
+  - Alex Piechowski <alex@piechowski.io>
+
+targets:
+  attack:
+    main: src/attack.cr
+  afk:
+    main: src/afk.cr
+
+crystal: '>= 1.17.1'
+
+license: MIT
+
+dependencies:
+  rosegold:
+    github: RosegoldMC/rosegold.cr

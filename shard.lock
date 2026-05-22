@@ -1,0 +1,15 @@
+# NOTICE: This lockfile contains some overrides from shard.override.yml
+version: 2.0
+shards:
+  habitat:
+    git: https://github.com/luckyframework/habitat.git
+    version: 0.4.9
+
+  openssl_ext:
+    git: https://github.com/spider-gazelle/openssl_ext.git
+    version: 2.8.5
+
+  rosegold: # Overridden
+    git: https://github.com/rosegoldmc/rosegold.cr.git
+    version: 0.7.0+git.commit.1a703385f5fb041c8f3e7bc7cdae13d2cc6394ca
+

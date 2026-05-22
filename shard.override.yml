@@ -1,0 +1,8 @@
+dependencies:
+  # rosegold:
+  #   path: ../rosegold.cr
+
+  # Use the GitHub repository directly until we hit 1.0
+  rosegold:
+    github: RosegoldMC/rosegold.cr
+    branch: main
