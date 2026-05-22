@@ -17,3 +17,4 @@ license: MIT
 dependencies:
   rosegold:
     github: RosegoldMC/rosegold.cr
+    branch: main
